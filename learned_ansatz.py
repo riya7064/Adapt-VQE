@@ -377,7 +377,12 @@ class AdaptiveAnsatzManager:
     # The main entry point: call this after every energy evaluation
     # ----------------------------------------------------------------
 
-    def observe(self, energy: float, params: Optional[np.ndarray] = None) -> bool:
+    def observe(
+        self,
+        energy: float,
+        params: Optional[np.ndarray] = None,
+        allow_growth: bool = True,
+    ) -> bool:
         """Feed one energy evaluation (ideally every optimizer iteration,
         e.g. from a callback) to the manager.
 
@@ -395,9 +400,14 @@ class AdaptiveAnsatzManager:
         self.full_energy_history.append(energy)
         self._stage_history.append(energy)
         if params is not None:
-            self.parameters = np.asarray(params, dtype=float)
+            incoming = np.asarray(params, dtype=float)
+            if incoming.size == self.num_active:
+                self.parameters = incoming
 
         if self._done:
+            return False
+
+        if not allow_growth:
             return False
 
         if not self._has_plateaued(self._stage_history):
@@ -429,6 +439,8 @@ class AdaptiveAnsatzManager:
         changed = False
         for _ in range(self.plateau_patience + 1):
             changed = self.observe(final_energy, params=final_params)
+            if changed:
+                return True
         return changed
 
     # ----------------------------------------------------------------

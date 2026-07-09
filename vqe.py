@@ -164,7 +164,8 @@ class AdaptiveVQECostFunction(VQECostFunction):
         job = self.estimator.run([(self.ansatz, self.hamiltonian, params)])
         energy = float(job.result()[0].data.evs)
         self.history.record(energy, params, phase=self._phase)
-        if self.ansatz_manager.observe(energy, params=params):
+        allow_growth = self._phase != "cobyla"
+        if self.ansatz_manager.observe(energy, params=params, allow_growth=allow_growth):
             raise AnsatzChangedError()
         return energy
 
@@ -277,21 +278,22 @@ def run_vqe(
         final_params,
     )
 
-    noise_report: Dict[str, Any] = {}
-    if run_noise_study:
-        noise_model = build_noise_model(
-            single_qubit_error=single_qubit_error,
-            two_qubit_error=two_qubit_error,
-            readout_error=readout_error,
-        )
-        noise_report = run_noise_comparison(
-            ansatz_manager.circuit,
-            vqe_problem.qubit_hamiltonian,
-            final_params,
-            reference_energy=vqe_problem.reference_total_energy,
-            noise_model=noise_model,
-            scale_factors=zne_scale_factors,
-        )
+    if not run_noise_study:
+        logger.warning("run_noise_study=False requested, but denoiser is required and will run.")
+
+    noise_model = build_noise_model(
+        single_qubit_error=single_qubit_error,
+        two_qubit_error=two_qubit_error,
+        readout_error=readout_error,
+    )
+    noise_report: Dict[str, Any] = run_noise_comparison(
+        ansatz_manager.circuit,
+        vqe_problem.qubit_hamiltonian,
+        final_params,
+        reference_energy=vqe_problem.reference_total_energy,
+        noise_model=noise_model,
+        scale_factors=zne_scale_factors,
+    )
 
     return VQEResult(
         molecule=vqe_problem.molecule,
@@ -396,6 +398,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         format="%(message)s",
     )
 
+    if args.skip_noise:
+        logger.warning("--skip-noise is ignored: denoiser execution is required for this workflow.")
+
     use_active_space = True if args.active_space else None
 
     print(f"=== Adapt-VQE: {args.molecule.upper()} ===")
@@ -415,7 +420,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         plateau_threshold=args.plateau_threshold,
         growth_benefit_threshold=args.growth_threshold,
         seed=args.seed,
-        run_noise_study=not args.skip_noise,
+        run_noise_study=True,
     )
     print(_format_report(result, problem))
 
