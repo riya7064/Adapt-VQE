@@ -1,3 +1,8 @@
 pyscf==2.12.0
 openfermion==1.7.1
 openfermionpyscf==0.5
+qiskit>=2.3.0
+qiskit-nature>=0.8.0
+qiskit-algorithms>=0.4.0
+qiskit-aer>=0.17.0
+numpy>=1.26.0

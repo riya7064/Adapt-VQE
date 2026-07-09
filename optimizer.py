@@ -83,6 +83,10 @@ from qiskit_algorithms.optimizers import (
 logger = logging.getLogger(__name__)
 
 
+class OptimizerInterrupted(Exception):
+    """Control-flow exception that must propagate out of optimizer phases."""
+
+
 # ===========================================================================
 # 1. OptimizationHistory -- single source of truth for everything a run
 #    needs to report (energies, params, eval count) and everything the
@@ -460,6 +464,8 @@ class AdaptiveVQEOptimizer:
                 x_current = result.x
                 cobyla_iters = int(getattr(result, "nit", remaining) or remaining)
                 phases.append(PhaseRecord("cobyla", cobyla_iters, "refinement phase"))
+            except OptimizerInterrupted:
+                raise
             except Exception as exc:
                 logger.warning("COBYLA phase failed (%s); falling back to %s", exc, self.fallback_name)
                 cost_fn.phase = self.fallback_name

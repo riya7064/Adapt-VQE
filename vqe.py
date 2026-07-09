@@ -1,374 +1,424 @@
 """
 vqe.py
 ------
-Orchestration layer. This is the ONLY file that combines
-hamiltonian.py + active_space_reduction.py + ansatz.py + optimizer.py +
-denoiser.py into an actual VQE run. Every other module stays standalone.
+Orchestration layer that wires the full Adapt-VQE pipeline:
 
-Provides:
-    Phase 1 (baseline):
-        run_baseline_vqe(...)          -> single VQE run + validation vs. reference
+    hamiltonian.py     ->  molecule + qubit Hamiltonian
+    learned_ansatz.py  ->  adaptive UCC ansatz (grow / rollback)
+    optimizer.py       ->  adaptive SPSA -> COBYLA optimization
+    denoiser.py        ->  ideal / noisy / ZNE evaluation
 
-    Phase 2A (ansatz comparison):
-        compare_ansatze(...)
-
-    Phase 2B (optimizer comparison):
-        compare_optimizers(...)
-
-    Phase 2C (initialization comparison):
-        get_initial_point(...)
-        compare_initializations(...)
-
-    Phase 2D (noise study):
-        run_noise_study(...)
+Run
+---
+    python vqe.py
+    python vqe.py --molecule h2 --budget 100
+    python vqe.py --molecule lih --skip-noise
 """
 
 from __future__ import annotations
 
+import argparse
+import logging
 import time
-from typing import Optional, Sequence
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
+from qiskit import transpile
 from qiskit.primitives import StatevectorEstimator
-from qiskit_nature.second_q.algorithms.initial_points import HFInitialPoint, MP2InitialPoint
+from qiskit.quantum_info import SparsePauliOp
+from qiskit_nature.second_q.mappers import JordanWignerMapper, QubitMapper
+from qiskit_nature.second_q.problems import ElectronicStructureProblem
+from qiskit_nature.second_q.transformers import ActiveSpaceTransformer
 
-from hamiltonian import get_qubit_hamiltonian, get_reference_energy
-from active_space_reduction import auto_select_active_space, report_problem_size
-from ansatz import get_ansatz, ansatz_stats
-from optimizer import get_optimizer, make_cost_function, run_optimization
 from denoiser import build_noise_model, run_noise_comparison
+from hamiltonian import (
+    build_driver_for_molecule,
+    get_electronic_structure_problem,
+    get_molecule_settings,
+)
+from learned_ansatz import AdaptiveAnsatzManager
+from optimizer import (
+    AdaptiveVQEOptimizer,
+    ConvergenceCriterion,
+    OptimizationHistory,
+    OptimizationReport,
+    OptimizerInterrupted,
+    VQECostFunction,
+)
+
+logger = logging.getLogger(__name__)
+
+ACTIVE_SPACE_BY_MOLECULE: Dict[str, Dict[str, Any]] = {
+    "lih": {
+        "num_electrons": 2,
+        "num_spatial_orbitals": 3,
+        "active_orbitals": [1, 2, 3],
+    },
+    "nh3": {
+        "num_electrons": 4,
+        "num_spatial_orbitals": 3,
+        "active_orbitals": None,
+    },
+}
 
 
-# --------------------------------------------------------------------------- #
-# Shared setup helper: molecule name -> (qubit_op, problem, mapper, nuc_rep)
-# --------------------------------------------------------------------------- #
+class AnsatzChangedError(OptimizerInterrupted):
+    """Raised when the adaptive ansatz grows or rolls back mid-optimization."""
+
+
+@dataclass
+class VQEProblem:
+    molecule: str
+    problem: ElectronicStructureProblem
+    qubit_hamiltonian: SparsePauliOp
+    mapper: QubitMapper
+    reference_total_energy: float
+    used_active_space: bool
+
+
+@dataclass
+class VQEResult:
+    molecule: str
+    optimizer: str
+    computed_total_energy: float
+    reference_total_energy: float
+    absolute_error: float
+    optimal_params: np.ndarray
+    final_num_excitations: int
+    total_pool_excitations: int
+    ansatz_summary: str
+    optimization_report: Optional[OptimizationReport]
+    ansatz_stats: Dict[str, Any]
+    noise_report: Dict[str, Any]
+    runtime_sec: float
+    growth_log: Sequence[Any]
+
+
+def _exact_ground_state_energy(qubit_hamiltonian: SparsePauliOp) -> float:
+    return float(np.min(np.linalg.eigvalsh(qubit_hamiltonian.to_matrix(sparse=False))))
+
+
 def prepare_problem(
-    molecule_name: str,
-    mapping: str = "jordan_wigner",
-    use_active_space: bool = False,
-    n_occupied: int = 2,
-    n_virtual: int = 2,
-):
-    """Build the qubit Hamiltonian for a molecule, optionally reducing the
-    active space first (recommended for H2O / NH3)."""
-    from hamiltonian import build_driver, get_electronic_structure_problem, get_mapper
+    molecule_name: str = "h2",
+    qubit_mapper: Optional[QubitMapper] = None,
+    use_active_space: Optional[bool] = None,
+) -> VQEProblem:
+    """Build the electronic-structure problem and qubit Hamiltonian."""
+    key = molecule_name.strip().lower()
+    get_molecule_settings(key)
 
-    driver = build_driver(molecule_name)
+    driver = build_driver_for_molecule(key)
     problem = get_electronic_structure_problem(driver)
 
+    if use_active_space is None:
+        use_active_space = key in ACTIVE_SPACE_BY_MOLECULE
+
     if use_active_space:
-        report_problem_size(problem, f"{molecule_name} full space")
-        problem = auto_select_active_space(problem, n_occupied=n_occupied, n_virtual=n_virtual)
-        report_problem_size(problem, f"{molecule_name} active space")
+        if key not in ACTIVE_SPACE_BY_MOLECULE:
+            raise ValueError(
+                f"No active-space preset for '{key}'. "
+                f"Supported: {', '.join(sorted(ACTIVE_SPACE_BY_MOLECULE))}"
+            )
+        active = ACTIVE_SPACE_BY_MOLECULE[key]
+        problem = ActiveSpaceTransformer(
+            num_electrons=active["num_electrons"],
+            num_spatial_orbitals=active["num_spatial_orbitals"],
+            active_orbitals=active["active_orbitals"],
+        ).transform(problem)
 
-    mapper = get_mapper(mapping)
-    qubit_op = mapper.map(problem.hamiltonian.second_q_op())
-    return qubit_op, problem, mapper
+    mapper = qubit_mapper or JordanWignerMapper()
+    qubit_hamiltonian = mapper.map(problem.hamiltonian.second_q_op())
 
-
-# --------------------------------------------------------------------------- #
-# Phase 2C: initial point strategies
-# --------------------------------------------------------------------------- #
-def get_initial_point(
-    strategy: str,
-    ansatz,
-    problem=None,
-    seed: int = 42,
-    scale: float = 0.1,
-) -> np.ndarray:
-    """
-    strategy : "random" | "hf" | "mp2"
-
-    "hf"   -> all-zero amplitudes (Hartree-Fock reference, only valid/meaningful
-              for UCC-type ansatze where params=0 means "just HF").
-    "mp2"  -> MP2-informed amplitudes seeded into the UCC ansatz
-              (falls back to zeros if the ansatz/problem doesn't support it,
-              e.g. HEA / TwoLocal have no chemical meaning for MP2 amplitudes).
-    "random" -> small random perturbation around zero.
-    """
-    strategy = strategy.strip().lower()
-    n = ansatz.num_parameters
-
-    if strategy == "random":
-        rng = np.random.default_rng(seed)
-        return rng.uniform(-scale, scale, n)
-
-    if strategy == "hf":
-        try:
-            hf_ip = HFInitialPoint()
-            hf_ip.ansatz = ansatz
-            hf_ip.problem = problem
-            return hf_ip.to_numpy_array()
-        except Exception:
-            return np.zeros(n)
-
-    if strategy == "mp2":
-        try:
-            mp2_ip = MP2InitialPoint()
-            mp2_ip.ansatz = ansatz
-            mp2_ip.problem = problem
-            return mp2_ip.to_numpy_array()
-        except Exception:
-            # Ansatz has no UCC excitation structure (e.g. HEA/TwoLocal) ->
-            # MP2 amplitudes don't map onto it; fall back to zeros.
-            return np.zeros(n)
-
-    raise ValueError(f"Unknown initialization strategy '{strategy}'. Use random/hf/mp2.")
-
-
-# --------------------------------------------------------------------------- #
-# Phase 1: baseline VQE
-# --------------------------------------------------------------------------- #
-def run_baseline_vqe(
-    molecule_name: str,
-    ansatz_name: str = "uccsd",
-    optimizer_name: str = "cobyla",
-    mapping: str = "jordan_wigner",
-    init_strategy: str = "hf",
-    maxiter: int = 200,
-    reps: int = 1,
-    use_active_space: bool = False,
-    n_occupied: int = 2,
-    n_virtual: int = 2,
-) -> dict:
-    """
-    Full Phase 1 baseline run:
-        build Hamiltonian -> build ansatz -> pick initial point ->
-        optimize -> compare to classical reference energy.
-    """
-    qubit_op, problem, mapper = prepare_problem(
-        molecule_name, mapping, use_active_space, n_occupied, n_virtual
+    return VQEProblem(
+        molecule=key,
+        problem=problem,
+        qubit_hamiltonian=qubit_hamiltonian,
+        mapper=mapper,
+        reference_total_energy=_exact_ground_state_energy(qubit_hamiltonian),
+        used_active_space=use_active_space,
     )
-    nuclear_repulsion = problem.nuclear_repulsion_energy
 
-    ansatz, _hf_state = get_ansatz(ansatz_name, problem=problem, mapper=mapper, reps=reps)
-    x0 = get_initial_point(init_strategy, ansatz, problem=problem)
 
-    estimator = StatevectorEstimator()
-    history = {"energies": [], "params": [], "n_evals": 0}
-    cost_fn = make_cost_function(estimator, ansatz, qubit_op, history)
+class AdaptiveVQECostFunction(VQECostFunction):
+    """Cost function that feeds every evaluation to AdaptiveAnsatzManager."""
 
-    optimizer = get_optimizer(optimizer_name, maxiter=maxiter)
-    report = run_optimization(optimizer, cost_fn, x0, history)
+    def __init__(
+        self,
+        estimator,
+        ansatz_manager: AdaptiveAnsatzManager,
+        hamiltonian: SparsePauliOp,
+        history: Optional[OptimizationHistory] = None,
+    ) -> None:
+        self.estimator = estimator
+        self.ansatz_manager = ansatz_manager
+        self.hamiltonian = hamiltonian
+        self.history = history if history is not None else OptimizationHistory()
+        self._phase = "unspecified"
 
-    computed_total_energy = report["final_energy"] + nuclear_repulsion
-    reference_total_energy = get_reference_energy(problem)
+    @property
+    def ansatz(self):
+        return self.ansatz_manager.circuit
 
+    def __call__(self, params: np.ndarray) -> float:
+        job = self.estimator.run([(self.ansatz, self.hamiltonian, params)])
+        energy = float(job.result()[0].data.evs)
+        self.history.record(energy, params, phase=self._phase)
+        if self.ansatz_manager.observe(energy, params=params):
+            raise AnsatzChangedError()
+        return energy
+
+
+def _evaluate_energy(
+    estimator,
+    ansatz_manager: AdaptiveAnsatzManager,
+    hamiltonian: SparsePauliOp,
+    params: np.ndarray,
+) -> float:
+    job = estimator.run([(ansatz_manager.circuit, hamiltonian, params)])
+    return float(job.result()[0].data.evs)
+
+
+def _circuit_stats(circuit) -> Dict[str, Any]:
+    transpiled = transpile(circuit, basis_gates=["rz", "sx", "x", "cx"], optimization_level=1)
     return {
-        "molecule": molecule_name,
-        "ansatz": ansatz_name,
-        "optimizer": optimizer_name,
-        "mapping": mapping,
-        "init_strategy": init_strategy,
-        "computed_energy": computed_total_energy,
-        "reference_energy": reference_total_energy,
-        "absolute_error": abs(computed_total_energy - reference_total_energy),
-        "convergence_curve": [e + nuclear_repulsion for e in report["energy_history"]],
-        "num_iterations": report["num_iterations"],
-        "num_function_evals": report["num_function_evals"],
-        "runtime_sec": report["runtime_sec"],
-        "optimal_params": report["optimal_params"],
-        "ansatz_stats": ansatz_stats(ansatz),
+        "num_parameters": circuit.num_parameters,
+        "num_qubits": circuit.num_qubits,
+        "raw_depth": circuit.depth(),
+        "transpiled_depth": transpiled.depth(),
+        "transpiled_gate_count": sum(transpiled.count_ops().values()),
     }
 
 
-# --------------------------------------------------------------------------- #
-# Phase 2A: ansatz comparison
-# --------------------------------------------------------------------------- #
-def compare_ansatze(
-    molecule_name: str,
-    ansatz_names: Sequence[str] = ("hea", "twolocal", "uccsd"),
-    optimizer_name: str = "cobyla",
-    mapping: str = "jordan_wigner",
-    maxiter: int = 200,
-    reps: int = 2,
-) -> dict:
-    """Run the same molecule/optimizer with each ansatz type and collect
-    accuracy / circuit depth / parameter count / runtime / convergence speed."""
-    results = {}
-    for name in ansatz_names:
-        results[name] = run_baseline_vqe(
-            molecule_name,
-            ansatz_name=name,
-            optimizer_name=optimizer_name,
-            mapping=mapping,
-            init_strategy="hf" if name == "uccsd" else "random",
-            maxiter=maxiter,
-            reps=reps,
-        )
-    return results
-
-
-# --------------------------------------------------------------------------- #
-# Phase 2B: optimizer comparison
-# --------------------------------------------------------------------------- #
-def compare_optimizers(
-    molecule_name: str,
-    optimizer_names: Sequence[str] = ("spsa", "cobyla", "slsqp", "gradient_descent"),
-    ansatz_name: str = "uccsd",
-    mapping: str = "jordan_wigner",
-    maxiter: int = 200,
-    reps: int = 1,
-) -> dict:
-    """Run the same molecule/ansatz with each optimizer and collect
-    iterations / function evals / runtime / stability / final energy."""
-    results = {}
-    for name in optimizer_names:
-        results[name] = run_baseline_vqe(
-            molecule_name,
-            ansatz_name=ansatz_name,
-            optimizer_name=name,
-            mapping=mapping,
-            init_strategy="hf",
-            maxiter=maxiter,
-            reps=reps,
-        )
-    return results
-
-
-# --------------------------------------------------------------------------- #
-# Phase 2C: initialization comparison
-# --------------------------------------------------------------------------- #
-def compare_initializations(
-    molecule_name: str,
-    init_strategies: Sequence[str] = ("random", "hf", "mp2"),
-    ansatz_name: str = "uccsd",
-    optimizer_name: str = "cobyla",
-    mapping: str = "jordan_wigner",
-    maxiter: int = 200,
-    reps: int = 1,
-) -> dict:
-    """
-    Run the same molecule/ansatz/optimizer with each initialization strategy
-    and collect initial energy / convergence speed / final accuracy.
-    """
-    qubit_op, problem, mapper = prepare_problem(molecule_name, mapping)
-    nuclear_repulsion = problem.nuclear_repulsion_energy
-    results = {}
-
-    for strategy in init_strategies:
-        ansatz, _ = get_ansatz(ansatz_name, problem=problem, mapper=mapper, reps=reps)
-        x0 = get_initial_point(strategy, ansatz, problem=problem)
-
-        estimator = StatevectorEstimator()
-        initial_energy = float(
-            estimator.run([(ansatz, qubit_op, x0)]).result()[0].data.evs
-        ) + nuclear_repulsion
-
-        history = {"energies": [], "params": [], "n_evals": 0}
-        cost_fn = make_cost_function(estimator, ansatz, qubit_op, history)
-        optimizer = get_optimizer(optimizer_name, maxiter=maxiter)
-        report = run_optimization(optimizer, cost_fn, x0, history)
-
-        final_energy = report["final_energy"] + nuclear_repulsion
-        reference_energy = get_reference_energy(problem)
-
-        results[strategy] = {
-            "initial_energy": initial_energy,
-            "final_energy": final_energy,
-            "reference_energy": reference_energy,
-            "absolute_error": abs(final_energy - reference_energy),
-            "num_iterations": report["num_iterations"],
-            "num_function_evals": report["num_function_evals"],
-            "convergence_curve": [e + nuclear_repulsion for e in report["energy_history"]],
-        }
-
-    return results
-
-
-# --------------------------------------------------------------------------- #
-# Phase 2D: noise study
-# --------------------------------------------------------------------------- #
-def run_noise_study(
-    molecule_name: str,
-    ansatz_name: str = "twolocal",
-    optimizer_name: str = "cobyla",
-    mapping: str = "jordan_wigner",
-    maxiter: int = 100,
-    reps: int = 1,
+def run_vqe(
+    molecule_name: str = "h2",
+    *,
+    optimizer_name: str = "adaptive",
+    optimizer_budget: int = 120,
+    use_active_space: Optional[bool] = None,
+    plateau_threshold: float = 1e-4,
+    plateau_patience: int = 5,
+    growth_benefit_threshold: float = 1e-3,
+    growth_batch_size: int = 1,
+    seed: int = 42,
+    run_noise_study: bool = True,
     single_qubit_error: float = 0.001,
     two_qubit_error: float = 0.01,
     readout_error: float = 0.02,
     zne_scale_factors: Sequence[int] = (1, 3, 5),
-) -> dict:
-    """
-    Optimize on the ideal simulator first (cheap), then evaluate the
-    converged parameters under: ideal / noisy / noisy+ZNE. This isolates
-    the *evaluation*-time noise degradation from optimizer noise-robustness
-    (which is instead covered in compare_optimizers with SPSA vs gradient-based).
-    """
-    baseline = run_baseline_vqe(
-        molecule_name,
-        ansatz_name=ansatz_name,
-        optimizer_name=optimizer_name,
-        mapping=mapping,
-        init_strategy="hf" if ansatz_name == "uccsd" else "random",
-        maxiter=maxiter,
-        reps=reps,
+) -> VQEResult:
+    """Run the full Adapt-VQE pipeline with a learned (adaptive) ansatz."""
+    t0 = time.time()
+    vqe_problem = prepare_problem(molecule_name, use_active_space=use_active_space)
+
+    ansatz_manager = AdaptiveAnsatzManager(
+        num_spatial_orbitals=vqe_problem.problem.num_spatial_orbitals,
+        num_particles=tuple(vqe_problem.problem.num_particles),
+        qubit_mapper=vqe_problem.mapper,
+        plateau_threshold=plateau_threshold,
+        plateau_patience=plateau_patience,
+        growth_benefit_threshold=growth_benefit_threshold,
+        growth_batch_size=growth_batch_size,
+        new_param_init="small_random",
+        seed=seed,
     )
 
-    qubit_op, problem, mapper = prepare_problem(molecule_name, mapping)
-    ansatz, _ = get_ansatz(ansatz_name, problem=problem, mapper=mapper, reps=reps)
+    if optimizer_name.strip().lower() != "adaptive":
+        raise ValueError(
+            "The learned ansatz requires the adaptive optimizer loop. "
+            "Use --optimizer adaptive (default)."
+        )
 
-    noise_model = build_noise_model(single_qubit_error, two_qubit_error, readout_error)
-    electronic_reference = baseline["reference_energy"] - problem.nuclear_repulsion_energy
-
-    noise_report = run_noise_comparison(
-        ansatz,
-        qubit_op,
-        baseline["optimal_params"],
-        reference_energy=electronic_reference,
-        noise_model=noise_model,
-        scale_factors=zne_scale_factors,
+    adaptive_optimizer = AdaptiveVQEOptimizer(
+        criterion=ConvergenceCriterion(patience=5, min_delta=1e-4, min_evals=10),
+        fallback_name="lbfgsb",
     )
 
-    nuc = problem.nuclear_repulsion_energy
-    return {
-        "molecule": molecule_name,
-        "ansatz": ansatz_name,
-        "ideal_energy": noise_report["ideal_energy"] + nuc,
-        "noisy_energy": noise_report["noisy_energy"] + nuc,
-        "zne_energy": noise_report["zne_energy"] + nuc,
-        "ideal_error": noise_report["ideal_error"],
-        "noisy_error": noise_report["noisy_error"],
-        "zne_error": noise_report["zne_error"],
-        "zne_details": noise_report["zne_details"],
-        "reference_energy": baseline["reference_energy"],
-    }
+    estimator = StatevectorEstimator()
+    last_report: Optional[OptimizationReport] = None
+    max_stages = len(ansatz_manager.pool) + 2
+
+    for _stage in range(1, max_stages + 1):
+        if ansatz_manager.is_done:
+            break
+
+        cost_fn = AdaptiveVQECostFunction(
+            estimator,
+            ansatz_manager,
+            vqe_problem.qubit_hamiltonian,
+        )
+
+        try:
+            last_report = adaptive_optimizer.optimize(
+                cost_fn,
+                ansatz_manager.initial_point,
+                total_budget=optimizer_budget,
+            )
+        except AnsatzChangedError:
+            if ansatz_manager.is_done:
+                break
+            continue
+
+        changed = ansatz_manager.finalize_stage(
+            last_report.final_energy,
+            last_report.optimal_params,
+        )
+        if changed:
+            if ansatz_manager.is_done:
+                break
+            continue
+        break
+
+    final_params = ansatz_manager.parameters
+    computed_total_energy = _evaluate_energy(
+        estimator,
+        ansatz_manager,
+        vqe_problem.qubit_hamiltonian,
+        final_params,
+    )
+
+    noise_report: Dict[str, Any] = {}
+    if run_noise_study:
+        noise_model = build_noise_model(
+            single_qubit_error=single_qubit_error,
+            two_qubit_error=two_qubit_error,
+            readout_error=readout_error,
+        )
+        noise_report = run_noise_comparison(
+            ansatz_manager.circuit,
+            vqe_problem.qubit_hamiltonian,
+            final_params,
+            reference_energy=vqe_problem.reference_total_energy,
+            noise_model=noise_model,
+            scale_factors=zne_scale_factors,
+        )
+
+    return VQEResult(
+        molecule=vqe_problem.molecule,
+        optimizer="adaptive",
+        computed_total_energy=computed_total_energy,
+        reference_total_energy=vqe_problem.reference_total_energy,
+        absolute_error=abs(computed_total_energy - vqe_problem.reference_total_energy),
+        optimal_params=final_params,
+        final_num_excitations=ansatz_manager.num_active,
+        total_pool_excitations=len(ansatz_manager.pool),
+        ansatz_summary=ansatz_manager.summary(),
+        optimization_report=last_report,
+        ansatz_stats=_circuit_stats(ansatz_manager.circuit),
+        noise_report=noise_report,
+        runtime_sec=time.time() - t0,
+        growth_log=list(ansatz_manager.growth_log),
+    )
 
 
-# --------------------------------------------------------------------------- #
-# Demo / smoke test
-# --------------------------------------------------------------------------- #
+def _format_report(result: VQEResult, problem: VQEProblem) -> str:
+    stats = result.ansatz_stats
+    lines = [
+        f"Molecule              : {result.molecule.upper()}",
+        f"Ansatz                : adaptive UCC (learned_ansatz.py)",
+        f"Optimizer             : {result.optimizer}",
+        f"Active space          : {'yes' if problem.used_active_space else 'no'}",
+        f"Qubits                : {problem.qubit_hamiltonian.num_qubits}",
+        f"Computed total energy : {result.computed_total_energy:.8f}",
+        f"Reference total energy: {result.reference_total_energy:.8f}",
+        f"Absolute error        : {result.absolute_error:.2e}",
+        (
+            f"Final excitations     : {result.final_num_excitations}/"
+            f"{result.total_pool_excitations}"
+        ),
+        f"Parameters            : {stats['num_parameters']}",
+        f"Transpiled depth      : {stats['transpiled_depth']}",
+        f"Runtime               : {result.runtime_sec:.2f}s",
+        "",
+        result.ansatz_summary,
+    ]
+
+    if result.optimization_report is not None:
+        lines.extend(["", "Last optimizer run:"])
+        for phase in result.optimization_report.phases:
+            lines.append(
+                f"  {phase.optimizer:12s}  iters={phase.iterations:4d}  {phase.reason}"
+            )
+        lines.append(
+            f"  function evals={result.optimization_report.num_function_evals}  "
+            f"switched_at_eval={result.optimization_report.switched_at_eval}"
+        )
+
+    if result.noise_report:
+        lines.extend(
+            [
+                "",
+                "Noise study (converged parameters):",
+                f"  ideal : {result.noise_report['ideal_energy']:.8f}  "
+                f"(err {result.noise_report['ideal_error']:.2e})",
+                f"  noisy : {result.noise_report['noisy_energy']:.8f}  "
+                f"(err {result.noise_report['noisy_error']:.2e})",
+                f"  zne   : {result.noise_report['zne_energy']:.8f}  "
+                f"(err {result.noise_report['zne_error']:.2e})",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="Run the full Adapt-VQE pipeline.")
+    parser.add_argument("--molecule", default="h2", help="Molecule preset: h2, lih, nh3.")
+    parser.add_argument("--budget", type=int, default=120, help="Optimizer budget per ansatz stage.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for new ansatz parameters.")
+    parser.add_argument(
+        "--plateau-threshold",
+        type=float,
+        default=1e-4,
+        help="Ansatz plateau sensitivity.",
+    )
+    parser.add_argument(
+        "--growth-threshold",
+        type=float,
+        default=1e-3,
+        help="Minimum energy drop to keep a growth trial.",
+    )
+    parser.add_argument(
+        "--active-space",
+        action="store_true",
+        help="Force active-space reduction (auto-enabled for lih/nh3).",
+    )
+    parser.add_argument(
+        "--skip-noise",
+        action="store_true",
+        help="Skip the denoiser ideal/noisy/ZNE comparison.",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show optimizer logs.")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(message)s",
+    )
+
+    use_active_space = True if args.active_space else None
+
+    print(f"=== Adapt-VQE: {args.molecule.upper()} ===")
+    problem = prepare_problem(args.molecule, use_active_space=use_active_space)
+    space_label = "active space" if problem.used_active_space else "full space"
+    print(
+        f"Problem: {problem.problem.num_spatial_orbitals} spatial orbitals, "
+        f"particles={problem.problem.num_particles}, "
+        f"qubits={problem.qubit_hamiltonian.num_qubits} ({space_label})"
+    )
+    print(f"Reference total energy: {problem.reference_total_energy:.8f}\n")
+
+    result = run_vqe(
+        args.molecule,
+        optimizer_budget=args.budget,
+        use_active_space=use_active_space,
+        plateau_threshold=args.plateau_threshold,
+        growth_benefit_threshold=args.growth_threshold,
+        seed=args.seed,
+        run_noise_study=not args.skip_noise,
+    )
+    print(_format_report(result, problem))
+
+
 if __name__ == "__main__":
-    print("=== Phase 1: baseline VQE (H2, UCCSD, COBYLA, HF init) ===")
-    result = run_baseline_vqe("H2", ansatz_name="uccsd", optimizer_name="cobyla")
-    print(f"computed={result['computed_energy']:.6f}  reference={result['reference_energy']:.6f}  "
-          f"error={result['absolute_error']:.2e}  nfev={result['num_function_evals']}")
-
-    print("\n=== Phase 2A: ansatz comparison (H2) ===")
-    ansatz_results = compare_ansatze("H2", maxiter=150)
-    for name, r in ansatz_results.items():
-        s = r["ansatz_stats"]
-        print(f"{name:10s} energy={r['computed_energy']:.6f}  error={r['absolute_error']:.2e}  "
-              f"depth={s['transpiled_depth']:4d}  params={s['num_parameters']:3d}  "
-              f"runtime={r['runtime_sec']:.2f}s")
-
-    print("\n=== Phase 2B: optimizer comparison (H2, UCCSD) ===")
-    opt_results = compare_optimizers("H2", maxiter=150)
-    for name, r in opt_results.items():
-        print(f"{name:18s} energy={r['computed_energy']:.6f}  error={r['absolute_error']:.2e}  "
-              f"nfev={r['num_function_evals']:4d}  runtime={r['runtime_sec']:.2f}s")
-
-    print("\n=== Phase 2C: initialization comparison (H2, UCCSD) ===")
-    init_results = compare_initializations("H2", maxiter=150)
-    for name, r in init_results.items():
-        print(f"{name:8s} initial={r['initial_energy']:.6f}  final={r['final_energy']:.6f}  "
-              f"error={r['absolute_error']:.2e}  nfev={r['num_function_evals']}")
-
-    print("\n=== Phase 2D: noise study (H2, TwoLocal) ===")
-    noise_result = run_noise_study("H2", ansatz_name="twolocal", maxiter=100)
-    print(f"ideal={noise_result['ideal_energy']:.6f}  noisy={noise_result['noisy_energy']:.6f}  "
-          f"zne={noise_result['zne_energy']:.6f}")
-    print(f"ideal_err={noise_result['ideal_error']:.4f}  noisy_err={noise_result['noisy_error']:.4f}  "
-          f"zne_err={noise_result['zne_error']:.4f}")
+    main()

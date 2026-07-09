@@ -88,7 +88,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from qiskit_nature.second_q.circuit.library import UCC
+from qiskit_nature.second_q.circuit.library import HartreeFock, UCC
 from qiskit_nature.second_q.mappers import QubitMapper
 
 Excitation = Tuple[Tuple[int, ...], Tuple[int, ...]]
@@ -311,11 +311,17 @@ class AdaptiveAnsatzManager:
         def excitation_fn(num_spatial_orbitals, num_particles, _active=active):
             return _active
 
+        hf_state = HartreeFock(
+            self.num_spatial_orbitals,
+            self.num_particles,
+            self.qubit_mapper,
+        )
         self.ansatz = UCC(
             num_spatial_orbitals=self.num_spatial_orbitals,
             num_particles=self.num_particles,
             qubit_mapper=self.qubit_mapper,
             excitations=excitation_fn,
+            initial_state=hf_state,
         )
 
         if self.ansatz.num_parameters != self.num_active:
